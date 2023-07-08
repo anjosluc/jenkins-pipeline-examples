@@ -1,0 +1,303 @@
+// Pipeline to build spring-maven applications through GCP Cloud build, scanning them on Sonar and deploying on GKE 
+
+pipeline {
+    agent {
+        kubernetes {
+            cloud "gcp-${ENVIRONMENT}"
+            defaultContainer 'jnlp'
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: infra
+  labels:
+    app: jenkins-slave
+spec:
+  nodeSelector:
+    infra: "true"
+  tolerations:
+  - key: "infra"
+    operator: "Equal"
+    value: "true"
+    effect: "NoSchedule"
+  serviceAccountName: jenkins
+  containers:
+  - name: maven
+    image: public.ecr.aws/l8v7c0k7/maven:3.6-jdk-11-slim
+    command:
+    - cat
+    env:
+    - name: JAVA_HOME
+      value: /usr/local/openjdk-11
+    tty: true
+  - name: gcloud
+    image: gcr.io/cloud-builders/gcloud
+    tty: true
+    command:
+    - cat
+  - name: kubectl
+    image: gcr.io/cloud-builders/kubectl
+    command:
+    - cat
+    tty: true
+"""
+        }
+    }
+    environment {
+        PROJECT_ID = "project-${ENVIRONMENT}"
+        CLUSTER_NAME = "example-${ENVIRONMENT}"
+        JAVA_HOME = '/usr/local/openjdk-11'
+        IMAGE_TAG = "gcr.io/${PROJECT_ID}/${project_name}:${branch}.${env.BUILD_NUMBER}"
+        MAVEN_GOALS = "clean install deploy"
+        LIBRARY = "${library}".toString()
+        BASE_IMAGE = "gcr.io/project-${ENVIRONMENT}/base:amazoncorretto-11-alpine"
+        SKIP_SONAR_TEST = "${SKIP_SONAR_TEST}"
+        SPRING_ENVS = " -Dspring.profiles.active=$environment -Denv.type=$environment"
+        LOCATION = 'southamerica-east1'
+        CREDENTIALS_ID = "project-${ENVIRONMENT}"
+    }
+    options {
+        datadog(collectLogs: true, tags: ["service:${project_name}", "branch:${branch}", "env:example-${environment}"])
+    }
+    stages {
+        stage("Definindo variáveis de ambiente para build e deploy"){
+            steps {
+                script {
+
+                    wrap([$class: 'BuildUser']) {
+                        user = env.BUILD_USER_ID
+                        userName = env.BUILD_USER
+                    }                    
+
+                    currentBuild.displayName = "${userName} #${env.BUILD_ID}"
+                    currentBuild.description = "${environment}".toUpperCase() + " - ${project_name}@${branch}"
+                }
+            }
+        }
+        stage("Checkout") {
+            steps {
+                script {
+                    echo "${branch}"
+                    checkout([$class: 'GitSCM', branches: [[name: "${branch}"]], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: "${env.GITHUB_KEY}", url: "${git_repository}"]]])
+
+                    sh(script:"mv ${source_dir}/* .; rm -rf ${source_dir}")
+
+                    
+                    echo "========================================="
+                    echo "GIT COMMIT - " + sh(script: "git rev-parse HEAD", returnStdout: true).trim()
+                    echo "GIT BRANCH - $branch" 
+                    echo "GIT COMMIT AUTHOR NAME - " + sh(script: "git show -s --pretty=%an", returnStdout: true)
+                    echo "GIT URL - $git_repository"
+                    echo "========================================="   
+                    
+                    dir("${project_name}"){
+                        def k8s_manifests = findFiles glob: "k8sconfig/**.y*ml"
+                        if(k8s_manifests.length > 0){
+                            echo "${project_name} DOES HAVE K8S MANIFESTS. SO IT'S A DEPLOYMENT"
+                            LIBRARY = "false"
+                        } else {
+                            echo "${project_name} DOESN'T HAVE K8S MANIFESTS. SO IT'S A LIBRARY"
+                            LIBRARY = "true"
+                        }
+                    }
+
+                }
+            }
+        }
+        stage("Build"){
+            steps {
+                script {
+                    container("maven"){
+                        def maven_goals_updated = env.MAVEN_GOALS
+                        configFileProvider([configFile(fileId: 'maven_settings_default', variable: 'MAVEN_SETTINGS')]) {
+                            
+                            //GET VERSION AND BUILD ARTIFACT
+                            if("${library}" != "true"){
+                                VERSION = sh(script: "mvn org.apache.maven.plugins:maven-help-plugin:3.2.0:evaluate -Dexpression=project.version -q -DforceStdout -f $project_name/pom.xml", returnStdout:true)
+                                echo VERSION
+                            }
+                            
+                            // FORCING MVN TEST
+                            maven_goals_updated = maven_goals_updated + env.SPRING_ENVS
+                            
+                            echo sh(script: "mvn -s $MAVEN_SETTINGS -f $project_name/pom.xml " + maven_goals_updated, returnStdout: true)
+                        }
+
+                        if(LIBRARY == "true"){
+                            currentBuild.result = "SUCCESS"    
+                            return
+                        }else {
+                            echo sh(script: "cp $project_name/target/${project_name}*.jar ${project_name}/${project_name}.jar", returnStdout: true)
+                            echo sh(script: "ls -lah $project_name", returnStdout: true)
+                        }
+                        
+                    }
+                }
+            }   
+        }
+        stage('Define Image Version'){
+            when {
+                expression { LIBRARY != "true" }
+            }
+            steps {
+                script {
+                    wrap([$class: 'BuildUser']) {
+                        def current_datetime = sh returnStdout: true, script: 'printf  `date "+%Y%m%d.%H%M%S"`'
+                        def GIT_COMMIT = sh(script: "git rev-parse HEAD", returnStdout: true).trim()
+                        VERSION = VERSION + "-" + GIT_COMMIT + "-" + current_datetime + "-"+ env.BUILD_USER_ID
+                    }
+                    IMAGE_TAG = "gcr.io/${PROJECT_ID}/${project_name}:" + VERSION
+                }
+            }
+        }
+        stage('SonarQube Scanner') {
+            when {
+                expression { LIBRARY != "true" && SKIP_SONAR_TEST == "false" }
+            }
+            steps {
+                script {
+                    container("maven"){
+                        dir("$project_name"){
+                            def scannerHome = tool 'SonarQubeNew';
+                            withSonarQubeEnv('SonarQubeNew') {
+                                sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=example -Dsonar.moduleKey=${project_name} -Dsonar.projectName=${project_name} -Dsonar.projectVersion="+ VERSION + " -Dsonar.sources=src/main/java/ -Dsonar.java.binaries=target/classes/ -Dsonar.language=java"
+                            }
+                        }
+                    }
+                    
+                }
+            }
+        }
+        stage('Sonarqube Quality Gate') {
+            when {
+                expression { LIBRARY != "true" && SKIP_SONAR_TEST == "false" }
+            }
+            steps {
+                script {
+                    timeout(time: 1, unit: 'HOURS'){
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK') {
+                        error "Pipeline abortada devido falha de Quality Gate do Sonar: ${qg.status}"
+                        }
+                    }
+                }
+            }
+        }
+        stage('Docker Image Build'){
+            when {
+                expression { LIBRARY != "true" }
+            }
+            steps {
+                script {
+                    container("gcloud"){
+                        echo VERSION
+                        def dockerfiles = findFiles glob: "$project_name/Dockerfile"
+                        def dockerfile = "example-dockerfile-gcp-default"
+                        if ("${environment}" == "prd"){
+                            dockerfile = "example-dockerfile-prd-gcp-default"
+                        }
+                        configFileProvider([configFile(fileId: dockerfile, targetLocation: '${project_name}/Dockerfile', variable: 'DOCKERFILE_DEFAULT')]) {
+                            dir("${project_name}"){
+                                contentReplace(
+                                    configs: [
+                                        fileContentReplaceConfig(
+                                            configs: [
+                                                fileContentReplaceItemConfig(
+                                                    search: '(\\$BASE_IMAGE)',
+                                                    replace: BASE_IMAGE,
+                                                    matchCount: 0),
+                                                fileContentReplaceItemConfig(
+                                                    search: '(\\$JAR_ARTIFACT)',
+                                                    replace: "${project_name}.jar",
+                                                    matchCount: 0)],
+                                            fileEncoding: 'UTF-8',
+                                            filePath: "Dockerfile")
+                                ])
+                                
+                                sh "PYTHONUNBUFFERED=1 gcloud builds submit -t ${IMAGE_TAG} ."
+                            }
+                        }
+                        
+                        currentBuild.description = currentBuild.description + " - " + IMAGE_TAG
+                    
+                    }
+                }
+            }
+        }
+        stage('Deploy to GKE') {
+            when {
+                expression { LIBRARY != "true" }
+            }
+            steps{
+                script {
+                    container("kubectl"){
+                        dir("${project_name}/k8sconfig"){
+                            def manifest_files = findFiles glob: "**//*-${environment}.y*ml"        
+                            if(manifest_files.length > 0){
+                                for(file in manifest_files){
+                                    contentReplace(
+                                        configs: [
+                                            fileContentReplaceConfig(
+                                                configs: [
+                                                    fileContentReplaceItemConfig(
+                                                        search: '(image:.*)',
+                                                        replace: "image: " + IMAGE_TAG,
+                                                        matchCount: 0)
+                                                    ],
+                                                fileEncoding: 'UTF-8',
+                                                filePath: file.path)
+                                    ])
+                                    sh "kubectl apply --dry-run -f " + file.path
+                                    sh "kubectl apply -f " + file.path
+                                }
+                            } else {
+                                echo "PLEASE CREATE MANIFEST CONFIG ON $project_name/k8sconfig/$project_name-${environment}.yml"
+                                currentBuild.result = "FAILED"
+                            }
+                        }
+                    }
+                    
+                }
+                
+            }
+        }
+        stage("Deployment Wait Rollout"){
+            when {
+                expression { LIBRARY != "true"}
+            }
+            steps {
+                script {
+                    container("kubectl"){
+                        sh "kubectl rollout status deploy -n example ${project_name} -w --timeout=10m"
+                    }
+                }
+            }
+            post {
+                success {
+                    script {
+                        currentBuild.result = "SUCCESS"
+                    }
+                }
+                failure {
+                    script {
+                        currentBuild.result = "FAILED"
+                        echo "Build failed. Rolling back...."
+                        container("kubectl"){
+                            sh "kubectl rollout undo deploy -n example ${project_name}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post { 
+        always { 
+            emailext (
+                subject: 'Jenkins - ${project_name} - ${environment} - ' + currentBuild.result,
+                recipientProviders: [[$class: 'DevelopersRecipientProvider'], [$class: 'RequesterRecipientProvider']],
+                mimeType: 'text/html',
+                body: '${SCRIPT, template="groovy-html.template"}'
+            )
+        }
+    }
+}

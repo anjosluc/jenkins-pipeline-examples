@@ -1,0 +1,150 @@
+import groovy.json.JsonSlurper
+import groovy.json.JsonBuilder
+
+def stacks_to_deploy = []
+
+def stacks_changed = new JsonSlurper().parseText(changed_files).unique()
+def stacks_removed = new JsonSlurper().parseText(removed_files).unique()
+
+pipeline{
+    agent{
+        label "ec2-${ENVIRONMENT}-slave"
+    }
+    stages{
+        stage("Set build description"){
+            steps {
+                script {
+                    currentBuild.displayName = "${GIT_BRANCH} - " + user_name
+                    currentBuild.description = "${GIT_COMMIT} - ${GIT_URL}"
+                }
+            }
+        }
+        stage("Collect Changed Stacks"){
+            when {
+                expression { stacks_changed.size() > 0 && "${ACTION}" == "MODIFY" }
+            }
+            steps{
+                script {
+                    echo "Checking for valid CF templates"
+                    for(stack in stacks_changed) {
+                        if (stack.matches("${FILE_FILTER_REGEX}")) {
+                            def stack_array = stack.split("/") 
+                            def stack_region = stack_array[stack_array.size() - 2]
+                            echo "Validating template " + stack
+                            sh "aws cloudformation validate-template --region " + stack_region + " --template-body fileb://" + stack
+                            echo "Validate ran with success for template " + stack
+                            stacks_to_deploy.push(stack)
+                        }
+                    }
+
+                    echo "IT WILL DEPLOY:\n"
+                    println stacks_to_deploy
+                }
+            }
+            post{
+                always{
+                    echo "========always========"
+                }
+                success{
+                    echo "========A executed successfully========"
+                }
+                failure{
+                    echo "========A execution failed========"
+                }
+            }
+        }
+        stage("Remove Existing Stacks") {
+            when {
+                expression { stacks_removed.size() > 0 && "${ACTION}" == "REMOVE" }
+            }
+            steps {
+                script {
+                    def remove_stacks = [:]
+                    def stacks_to_remove = []
+
+                    echo "Checking for templates to remove"
+                    for(stack in stacks_removed) {
+                        if (stack.matches("${FILE_FILTER_REGEX}")) {
+                            def stack_array = stack.split("/") 
+                            def stack_region = stack_array[stack_array.size() - 2]
+                            def stack_name = stack_array.last().split("\\.")[0]
+                            echo "Validating template " + stack_name
+                            sh 'aws cloudformation describe-stacks --region ' + stack_region + ' --stack-name ' + stack_name
+                            stacks_to_remove.push(stack_region + "/" + stack_name)
+                        }
+                    }
+                    echo "Removing stacks..."
+                    for(stack in stacks_to_remove){
+                        remove_stacks[stack] = {
+                            stage("Removing " + stack){
+                                def stack_region = stack.split("/")[0]
+                                def stack_name = stack.split("/")[1]
+                                sh 'aws cloudformation delete-stack --stack-name ' + stack_name + ' --region ' + stack_region
+                            }
+                        }
+                    }
+                    parallel remove_stacks
+                }
+            }
+        }
+        stage("Create/Update Stacks"){
+            when {
+                expression { stacks_changed.size() > 0 && "${ACTION}" == "MODIFY" }
+            }
+            steps {
+                script {
+                    def stack_deploys = [:]
+                    for(stack in stacks_to_deploy) {
+                        def stack_array = stack.split("/") 
+                        def stack_name = stack_array.last().split("\\.")[0]
+                        def stack_region = stack_array[stack_array.length - 2]
+                        println stack_name
+                        def stack_path = stack_array.take(stack_array.length - 1).join("/")
+                        println stack_path
+
+                        def use_parameters = false
+                        def params = '''[{"ParameterKey": "Key","ParameterValue": "Value"}]'''
+
+                        def stack_region_name = stack_region + "/" + stack_name
+
+                        stack_deploys[stack_region_name] = {                        
+                            stage("Deploy " + stack_region_name){
+                                dir(stack_path){
+                                    stack_region = stack_region_name.split("/")[0]
+                                    stack_name = stack_region_name.split("/")[1]
+                                    def param_files = findFiles glob: stack_name + ".parameters"
+
+                                    if(param_files.length > 0){
+                                        use_parameters = true
+                                        params = readYaml file: stack_name + ".parameters"
+                                        params = new JsonBuilder(params).toPrettyString()
+                                        echo "PARAMS TO USE: \n" + params
+                                    }
+
+                                    build job: 'Deploy_Cloudformation_Generic', parameters: [string(name: 'BRANCH', value: "${DEFAULT_BRANCH}"), text(name: 'PARAMETERS', value: params), string(name: 'PATH_TEMPLATE', value: stack_path + "/" + stack_name + ".yml"), string(name: 'ENVIRONMENT', value: "${ENVIRONMENT}"), string(name: 'STACK_NAME', value: stack_name), string(name: 'REGION', value: stack_region), booleanParam(name: 'USE_PARAMETERS', value: use_parameters), booleanParam(name: 'auto_execute_changeset', value: true)]
+                                }
+                            }
+                        }
+                    }
+                    parallel stack_deploys
+                }
+            }
+        }
+    }
+    post{
+        always{
+            emailext (
+                subject: 'Jenkins - CF UPDATE - ${ENVIRONMENT} - ' + currentBuild.result,
+                recipientProviders: [[$class: 'DevelopersRecipientProvider'], [$class: 'RequesterRecipientProvider']],
+                mimeType: 'text/html',
+                body: '${SCRIPT, template="groovy-html.template"}'
+            )
+        }
+        success{
+            echo "========pipeline executed successfully ========"
+        }
+        failure{
+            echo "========pipeline execution failed========"
+        }
+    }
+}

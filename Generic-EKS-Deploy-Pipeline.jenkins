@@ -1,0 +1,382 @@
+def VERSION = ""
+def manifest_path = "$project_name/k8sconfig/$project_name-${environment}.yml"
+def realAgent = ""
+def default_region = "us-east-1"
+def account_id = ""
+
+if ("${environment}" == "prd"){
+    default_region = "sa-east-1"
+}
+
+switch("${environment}"){
+    case "dev":
+        account_id = "000000000000"
+        break
+    case "uat":
+        account_id = "111111111111"
+        break
+    case "prd":
+        account_id = "222222222222"
+        break
+    default:
+        account_id = ""
+        break
+}
+
+if (account_id == ""){
+    currentBuild.result = "FAILED"
+    echo "Please define one environment to deploy"
+    return
+}
+
+pipeline {
+    agent {
+        kubernetes {
+            cloud "eks-${ENVIRONMENT}"
+            defaultContainer 'jnlp'
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: infra
+  labels:
+    app: jenkins-slave
+spec:
+  nodeSelector:
+    infra: "true"
+  tolerations:
+  - key: "infra"
+    operator: "Equal"
+    value: "true"
+    effect: "NoSchedule"
+  securityContext:
+    fsGroup: 1000
+  serviceAccountName: jenkins
+  volumes:
+  - hostPath:
+      path: /var/run/docker.sock
+      type: File
+    name: docker-sock
+  containers:
+  - name: maven
+    image: public.ecr.aws/l8v7c0k7/maven:3.6-jdk-11-slim
+    command:
+    - cat
+    env:
+    - name: JAVA_HOME
+      value: /usr/local/openjdk-11
+    tty: true
+  - name: docker
+    image: gcr.io/cloud-builders/docker
+    command:
+    - cat
+    tty: true
+    volumeMounts:
+    - mountPath: /var/run/docker.sock
+      name: docker-sock
+  - name: awscli
+    image: python:3.6
+    command:
+    - cat
+    tty: true
+  - name: kubectl
+    image: gcr.io/cloud-builders/kubectl
+    command:
+    - cat
+    tty: true
+"""
+        }
+    }
+    options {
+        datadog(collectLogs: true, tags: ["service:${project_name}", "branch:${branch}", "env:example-${environment}"])
+    }
+    environment {
+        ENVIRONMENT = "${environment}".toLowerCase().take(3)
+        DEPLOY_ENVIRONMENT = "${environment}"
+        AWS_DEFAULT_REGION = default_region.toString()
+        MAVEN_GOALS = "clean install deploy"
+        JAVA_HOME = '/usr/local/openjdk-11'
+        LIBRARY = "${library}".toString()
+        SKIP_SONAR_TEST = "${SKIP_SONAR_TEST}"
+        S3_BUCKET = "file-upload-${environment}/devops/codebuild/example"
+        ACCOUNT_ID = ""
+        SPRING_ENVS = " -Dspring.profiles.active=$environment -Denv.type=$environment -Denv.domain=PORTAL"
+    }
+    stages {
+        stage("Definindo variáveis de ambiente para build e deploy"){
+            steps {
+                script {
+
+                    wrap([$class: 'BuildUser']) {
+                        user = env.BUILD_USER_ID
+                        userName = env.BUILD_USER
+                    }                    
+
+                    currentBuild.displayName = "${userName} #${env.BUILD_ID}"
+                    currentBuild.description = "${environment}".toUpperCase() + " - ${project_name}@${branch}"
+                }
+            }
+        }
+        stage("Checkout") {
+            steps {
+                script {
+                    echo "${branch}"
+                    checkout([$class: 'GitSCM', branches: [[name: "${branch}"]], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: "${env.GITHUB_KEY}", url: "${git_repository}"]]])
+
+                    sh(script:"mv ${source_dir}/* .; rm -rf ${source_dir}")
+                    echo "========================================="
+                    echo "GIT COMMIT - " + sh(script: "git rev-parse HEAD", returnStdout: true).trim()
+                    echo "GIT BRANCH - $branch" 
+                    echo "GIT COMMIT AUTHOR NAME - " + sh(script: "git show -s --pretty=%an", returnStdout: true)
+                    echo "GIT URL - $git_repository"
+                    echo "========================================="   
+
+                    dir("${project_name}"){
+                        def k8s_manifests = findFiles glob: "k8sconfig/**.y*ml"
+                        if(k8s_manifests.length > 0){
+                            echo "${project_name} DOES HAVE K8S MANIFESTS. SO IT'S A DEPLOYMENT"
+                            LIBRARY = "false"
+                        } else {
+                            echo "${project_name} DOESN'T HAVE K8S MANIFESTS. SO IT'S A LIBRARY"
+                            LIBRARY = "true"
+                        }
+                    }
+
+                }
+            }
+        }
+        stage("Build"){
+            steps {
+                script {
+                    container("maven"){
+                        def maven_goals_updated = env.MAVEN_GOALS
+                        configFileProvider([configFile(fileId: 'maven_settings_default', variable: 'MAVEN_SETTINGS')]) {
+                            
+                            //GET VERSION AND BUILD ARTIFACT
+                            if("${library}" != "true"){
+                                VERSION = sh(script: "mvn org.apache.maven.plugins:maven-help-plugin:3.2.0:evaluate -Dexpression=project.version -q -DforceStdout -f $project_name/pom.xml", returnStdout:true)
+                                echo VERSION
+                            }
+                            
+                            // FORCING MVN TEST
+                            maven_goals_updated = maven_goals_updated + env.SPRING_ENVS
+                            
+                            echo sh(script: "mvn -s $MAVEN_SETTINGS -f $project_name/pom.xml " + maven_goals_updated, returnStdout: true)
+                        }
+
+                        if(LIBRARY == "true"){
+                            currentBuild.result = "SUCCESS"    
+                            return
+                        }else {
+                            echo sh(script: "cp $project_name/target/${project_name}*.jar ${project_name}/${project_name}.jar", returnStdout: true)
+                            echo sh(script: "ls -lah $project_name", returnStdout: true)
+                        }
+                        
+                    }
+                }
+            }   
+        }
+        stage('Define Image Version'){
+            when {
+                expression { LIBRARY != "true" }
+            }
+            steps {
+                script {
+                    wrap([$class: 'BuildUser']) {
+                        def current_datetime = sh returnStdout: true, script: 'printf  `date "+%Y%m%d.%H%M%S"`'
+                        def GIT_COMMIT = sh(script: "git rev-parse HEAD", returnStdout: true).trim()
+                        VERSION = VERSION + "-" + GIT_COMMIT + "-" + current_datetime + "-"+ env.BUILD_USER_ID
+                    }
+                }
+            }
+        }
+        stage('SonarQube Scanner') {
+            when {
+                expression { LIBRARY != "true" && SKIP_SONAR_TEST == "false" }
+            }
+            steps {
+                script {
+                    container("maven"){
+                        dir("$project_name"){
+                            def scannerHome = tool 'SonarQubeNew';
+                            withSonarQubeEnv('SonarQubeNew') {
+                                sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=key -Dsonar.moduleKey=${project_name} -Dsonar.projectName=${project_name} -Dsonar.projectVersion="+ VERSION + " -Dsonar.sources=src/main/java/ -Dsonar.java.binaries=target/classes/ -Dsonar.language=java"
+                            }
+                        }
+                    }
+                    
+                }
+            }
+        }
+        stage('Sonarqube Quality Gate') {
+            when {
+                expression { LIBRARY != "true" && SKIP_SONAR_TEST == "false" }
+            }
+            steps {
+                script {
+                    timeout(time: 1, unit: 'HOURS'){
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK') {
+                        error "Pipeline abortada devido falha de Quality Gate do Sonar: ${qg.status}"
+                        }
+                    }
+                }
+            }
+        }
+        stage("Make Docker Image"){
+            when {
+                expression { LIBRARY != "true" }
+            }
+            steps {
+                script {
+                    echo VERSION
+                    def dockerfiles = findFiles glob: "$project_name/Dockerfile"
+                    if(dockerfiles.length > 0){    
+                        container("docker"){
+                            //Replacing Dockerfile to use Datadog base image in production
+                            if ("${environment}" == "prd"){
+                                sh "sed -i -E 's/(FROM) (.*)/\\1 ${datadog_base_image_tag}/g' ${project_name}/Dockerfile"
+                                sh "sed -i -E 's/ENTRYPOINT(.*)(java)(.*)/ENTRYPOINT\\1java \$JAVA_AGENT \\3/g' ${project_name}/Dockerfile"
+                            }
+                            
+                            docker.withRegistry("https://00000000000.dkr.ecr.us-east-1.amazonaws.com", "ecr:us-east-1:AWS"){
+                                docker.build("${project_name}:$VERSION", "$project_name --build-arg JAR_ARTIFACT=${project_name}.jar")
+                            }
+                        }
+                    }
+                    else {
+
+                        def dockerfile = "dockerfile-default"
+                        if ("${environment}" == "prd"){
+                            dockerfile = "dockerfile-prd-default"
+                        }
+
+                        container("docker"){
+                            configFileProvider([configFile(fileId: dockerfile, targetLocation: '${project_name}/Dockerfile', variable: 'DOCKERFILE_DEFAULT')]) {
+                                docker.withRegistry("https://0000000000.dkr.ecr.us-east-1.amazonaws.com", "ecr:us-east-1:AWS"){
+                                    docker.build("${project_name}:$VERSION", "$project_name --build-arg JAR_ARTIFACT=${project_name}.jar")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage("Setup ECR"){
+            when {
+                expression { LIBRARY != "true" }
+            }
+            steps {
+                script {
+                    def ecr_url = ""
+
+                    ACCOUNT_ID = account_id 
+                    ecr_url = "https://" + account_id + ".dkr.ecr." + default_region + ".amazonaws.com"
+
+                    // CHECK IF ECR REPOSITORY EXISTS
+                    container("awscli"){
+                        try {
+                            sh "pip install awscli cfn-lint"
+                            def list_repositories = sh(script: "aws ecr describe-repositories --repository-names ${project_name}", returnStdout: true)
+                        } catch (Exception e){
+                            echo "REPOSITORY ${project_name} DOESN'T EXIST. CREATING NEW ONE..."
+                            sh(script: "aws ecr create-repository --repository-name ${project_name} --image-scanning-configuration scanOnPush=true")
+                        }        
+                    }
+
+                    container("docker"){
+                        def ecr_environment = "AWS " + "${environment}".toUpperCase()
+                        docker.withRegistry(ecr_url, "ecr:" + default_region + ":" + ecr_environment){
+                            docker.image("${project_name}:${VERSION}").push(VERSION)
+                        }
+                        sh "docker rmi -f ${project_name}:${VERSION}"
+                    }
+                }
+
+            }
+        }
+        stage("Kubernetes Deploy"){
+            when {
+                expression { LIBRARY != "true"}
+            }
+            steps {
+                script {
+                    container("kubectl"){
+
+                        dir("$project_name/k8sconfig"){
+                            def manifest_files = findFiles glob: "**//*-${environment}.y*ml"
+                            
+                            if(manifest_files.length > 0){
+                                for(file in manifest_files){
+                                    contentReplace(
+                                        configs: [
+                                            fileContentReplaceConfig(
+                                                configs: [
+                                                    fileContentReplaceItemConfig(
+                                                        search: '(ECR_ACCOUNT_ID)',
+                                                        replace: account_id,
+                                                        matchCount: 0),
+                                                    fileContentReplaceItemConfig(
+                                                        search: '(REGION)',
+                                                        replace: default_region,
+                                                        matchCount: 0),
+                                                    fileContentReplaceItemConfig(
+                                                        search: '(DEFAULT_VERSION)',
+                                                        replace: VERSION,
+                                                        matchCount: 0)
+                                                    ],
+                                                fileEncoding: 'UTF-8',
+                                                filePath: file.path)
+                                    ])
+                                    sh "kubectl apply --dry-run -f " + file.path
+                                    sh "kubectl apply -f " + file.path
+                                }
+                            } else {
+                                echo "PLEASE CREATE MANIFEST CONFIG ON $project_name/k8sconfig/$project_name-${environment}.yml"
+                                currentBuild.result = "FAILED"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage("Deployment Wait Rollout"){
+            when {
+                expression { LIBRARY != "true"}
+            }
+            steps {
+                script {
+                    container("kubectl"){
+                        sh "kubectl rollout status deploy -n example ${project_name} -w --timeout=10m"
+                    }
+                }
+            }
+            post {
+                success {
+                    script {
+                        currentBuild.result = "SUCCESS"
+                    }
+                }
+                failure {
+                    script {
+                        currentBuild.result = "FAILED"
+                        echo "Build failed. Rolling back...."
+                        container("kubectl"){
+                            sh "kubectl rollout undo deploy -n example ${project_name}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post { 
+        always { 
+            emailext (
+                subject: 'Jenkins - ${project_name} - ${environment} - ' + currentBuild.result,
+                recipientProviders: [[$class: 'DevelopersRecipientProvider'], [$class: 'RequesterRecipientProvider']],
+                mimeType: 'text/html',
+                body: '${SCRIPT, template="groovy-html.template"}'
+            )
+        }
+    }
+}

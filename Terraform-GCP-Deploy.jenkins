@@ -1,0 +1,83 @@
+pipeline{
+    agent{
+        label "ec2-${environment}-slave"
+    }
+    tools {
+        type: 'org.jenkinsci.plugins.terraform.TerraformInstallation' 'terraform'
+    }
+    options {
+        withCredentials([file(credentialsId: "svcaccount-example-${environment}", variable: 'GC_KEY')])
+        ansiColor('xterm')
+        timestamps()
+    }
+    environment {
+        TF_HOME = tool name: 'terraform', type: 'org.jenkinsci.plugins.terraform.TerraformInstallation'
+        PATH = "$TF_HOME:$PATH"
+        GOOGLE_APPLICATION_CREDENTIALS = ""
+    }
+    stages{
+        stage("Terraform Init"){
+            steps{
+                script {
+                    dir("${path_stack}") {
+                        currentBuild.description = "PROJECT: example-${environment}\nPATH STACK: ${path_stack}\n"
+                        sh "GOOGLE_APPLICATION_CREDENTIALS=$GC_KEY terraform init"
+                    }
+                }
+            }
+            post{
+                success{
+                    echo "========Terraform Init executed successfully ======="
+                }
+                failure{
+                    echo "========Terraform Init execution failed ======="
+                }
+            }
+        }
+        stage("Terraform Plan"){
+            steps{
+                script {
+                    dir("${path_stack}") {
+                        currentBuild.description = "PROJECT: example-${environment}\nPATH STACK: ${path_stack}\nBUILDING..."
+                        sh "GOOGLE_APPLICATION_CREDENTIALS=$GC_KEY terraform plan"
+                    }
+                }
+            }
+            post{
+                success{
+                    echo "========Terraform Plan executed successfully========"
+                }
+                failure{
+                    echo "========Terraform Plan execution failed========"
+                }
+            }
+        }
+        stage("Terraform Apply") {
+            steps{
+                dir("${path_stack}") {
+                    sh "GOOGLE_APPLICATION_CREDENTIALS=$GC_KEY terraform apply --auto-approve=true"
+                }
+            }
+            post{
+                success{
+                    echo "========Terraform Apply executed successfully========"
+                }
+                failure{
+                    echo "========Terraform Apply execution failed========"
+                    sh 'GOOGLE_APPLICATION_CREDENTIALS=$GC_KEY terraform destroy --auto-approve=true'
+                }
+            }
+        }
+    }
+    post{
+        success{
+            script {
+                currentBuild.description = "PROJECT: example-${environment}\nPATH STACK: ${path_stack}\nDEPLOYED SUCCESSFULLY..."
+            }
+            echo "======== Stack Created/Updated successfully ========"
+        }
+        failure{
+            echo "======== Stack Created/Updated failed ========"
+        }
+    }
+}

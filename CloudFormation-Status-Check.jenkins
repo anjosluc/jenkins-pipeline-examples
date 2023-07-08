@@ -1,0 +1,187 @@
+// Jenkins pipeline to validate CloudFormation MRs on Gitlab, it can be used for status checks
+
+import groovy.json.JsonSlurper
+import groovy.json.JsonBuilder
+
+def changed_files = []
+def stacks_to_test = []
+def region_to_deploy = ""
+
+if ("${ENVIRONMENT}" == "prd"){
+    region_to_deploy = "sa-east-1"
+} else {
+    region_to_deploy = "us-east-1"
+}
+
+
+pipeline{
+    agent{
+        label "ec2-slave"
+    }
+    environment {
+        SOURCE_BRANCH = "origin/${env.gitlabSourceBranch}"
+        TARGET_BRANCH = "origin/${env.gitlabTargetBranch}"
+        PROJECT_ID = "${env.gitlabMergeRequestTargetProjectId}"
+        TASKCAT_FILE = "taskcat-default"
+    }
+    stages{
+        stage("Checkout Branch MR"){
+            steps{
+                script {
+                    try {
+                        // Pull the source and test a merge
+                        checkout changelog: true, poll: true, scm: [
+                            $class: 'GitSCM',
+                            branches: [[name: "origin/${env.gitlabSourceBranch}"]],
+                            doGenerateSubmoduleConfigurations: false,
+                            extensions: [[
+                                $class: 'PreBuildMerge',
+                                options: [
+                                fastForwardMode: 'FF',
+                                mergeRemote: 'origin',
+                                mergeStrategy: 'default',
+                                mergeTarget: "${env.gitlabTargetBranch}"
+                                ]
+                            ]],
+                            submoduleCfg: [],
+                            userRemoteConfigs: [[
+                                credentialsId: 'gitlab-temp',
+                                name: 'origin',
+                                url: "${env.gitlabSourceRepoHttpUrl}"
+                            ]]
+                        ]
+                        
+                        echo "MR triggered - SOURCE is origin/${env.gitlabSourceBranch}"
+                        echo "MR triggered - TARGET is origin/${env.gitlabTargetBranch}"
+                    } catch (Exception e) {
+                        throw e
+                    }
+                }
+            }
+            /*post{
+                always{
+                    echo "========always========"
+                }
+                success{
+                    echo "========A executed successfully========"
+                }
+                failure{
+                    echo "========A execution failed========"
+                }
+            }*/
+        }
+        stage("Collect and Validate Templates"){
+            steps{
+                script {
+                    try {
+                        
+                        sh(script: "curl -H \"Accept: application/json\" -H \"Content-Type: application/json\" -H \"PRIVATE-TOKEN: TOKEN\" http://gitlab.example.com/api/v4/projects/${env.PROJECT_ID}/merge_requests/${env.gitlabMergeRequestIid}/changes > response.json", returnStdout: true)
+                        
+                        def responseJson = readJSON file: "response.json"
+                        def validate_templates = [:]
+                        for(change in responseJson.changes){
+                            def file_path = change.new_path
+                            def stack_array = file_path.split("/") 
+                            def stack_name = stack_array.last().split("\\.")[0]
+                            if (file_path.matches("${FILE_FILTER_REGEX}")) {
+                                validate_templates[stack_name] = {
+                                    stage("CF Validate file: " + file_path){
+                                        echo "Validating template " + file_path
+                                        sh "aws cloudformation validate-template --region " + region_to_deploy + " --template-body fileb://" + file_path
+                                        echo "Validate ran with success for template " + file_path
+                                        stacks_to_test.push(file_path)
+                                    }
+                                }
+                            }
+                        }
+                        parallel validate_templates
+                    } catch (Exception e) {
+                        throw e
+                    }
+                }
+            }
+            /*post{
+                always{
+                    echo "========always========"
+                }
+                success{
+                    echo "========A executed successfully========"
+                }
+                failure{
+                    echo "========A execution failed========"
+                }
+            }*/
+        }
+        stage("Test Stacks - Cfn-Lint"){
+            when {
+                expression { stacks_to_test.size() > 0 }
+            }
+            steps{
+                script {
+                    sh 'sudo pip3 install cfn-lint'
+                    def stack_tests = [:]
+                    for(stack in stacks_to_test) {
+                        def stack_array = stack.split("/") 
+                        def stack_name = stack_array.last().split("\\.")[0]
+                        println stack_name
+                        def stack_path = stack_array.take(stack_array.length - 1).join("/")
+                        println stack_path
+
+                        stack_tests[stack_name] = {
+                            dir(stack_path) {
+                                sh 'cfn-lint -i W -b ' + stack_array.last()
+                                /*sh 'mkdir taskcat-' + stack_name
+                                def params = ""
+                                def param_files = findFiles glob: stack_name + ".parameters"
+                                def use_parameters = false
+                                sh "cp " + stack_array.last() + " taskcat-" + stack_name + "/"
+
+                                if(param_files.length > 0){
+                                    use_parameters = true
+                                    params = readYaml file: stack_name + ".parameters"
+                                    params = new JsonBuilder(params).toPrettyString()
+                                    echo "PARAMS TO USE: \n" + params
+                                    writeJSON file: "taskcat-" + stack_name + "/.taskcat_overrides.yml", json: params
+                                }
+
+                                dir('taskcat-' + stack_name) {
+                                    configFileProvider([configFile(fileId: TASKCAT_FILE, targetLocation: '.taskcat.yml')]) {
+                                        sh "sed -i 's/<STACK_NAME>/" + stack_name + "/g' .taskcat.yml"
+                                        sh "sed -i 's/<STACK_FILE>/" + stack_array.last() + "/g' .taskcat.yml"
+                                        sh "cat .taskcat.yml"
+                                        sh "taskcat lint"
+                                    }
+                                }*/
+                            }
+                        }
+                    }
+                    parallel stack_tests
+                }
+            }
+            /*post{
+                always{
+                    echo "========always========"
+                }
+                success{
+                    echo "========A executed successfully========"
+                }
+                failure{
+                    echo "========A execution failed========"
+                }
+            }*/
+        }
+
+
+
+    }
+    post{
+        success{
+            updateGitlabCommitStatus(name: 'build', state: 'success')
+            addGitLabMRComment comment: "CF Good to go! Logs on $BUILD_URL"
+        }
+        failure{
+            updateGitlabCommitStatus(name: 'build', state: 'failed')
+            addGitLabMRComment comment: "Something unexpected happened. Inspect Jenkins logs on $BUILD_URL."
+        }
+    }
+}

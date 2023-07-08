@@ -1,0 +1,171 @@
+pipeline{
+    agent{
+        //label "master"
+        kubernetes {
+            cloud "kubernetes-${ENVIRONMENT}"
+            defaultContainer 'python-builder'
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: jenkins-slave
+spec:
+  containers:
+  - name: python-builder
+    image: awscli-cfn-lint
+    command:
+    - cat
+    tty: true
+"""            
+            }
+    }
+    options {
+        withAWS(credentials: 'AWS ' + "${ENVIRONMENT}".toUpperCase(), region: "${REGION}")
+        ansiColor('xterm')
+    }
+    environment {
+        AWS_DEFAULT_REGION = "${REGION}"
+        CREATE_STACK = "true"
+        EXECUTE_CHANGE_SET = false
+    }
+    stages{
+        stage("TEMPLATE BUILD"){
+            steps{
+                script {
+                    currentBuild.displayName = "${STACK_NAME} - ${ENVIRONMENT} - ${REGION}"
+                    echo "========GETTING FILE========"
+                    def file = writeFile file: "parameters.json", text: "${PARAMETERS}"
+                    def parameters = readJSON file: "parameters.json"
+                    
+                    echo "========STACK PARAMETERS========"
+                    println parameters
+
+                    echo "========CFN LINT================"
+                    sh 'cfn-lint -i W -b ${PATH_TEMPLATE}'
+
+                    echo "========STACK TEMPLATE=========="
+                    def template = readFile file: "${PATH_TEMPLATE}"
+                    println template
+                }
+            }
+            post{
+                success{
+                    echo "========executed successfully========"
+                }
+                failure{
+                    echo "========execution failed========"
+                }
+            }
+        }
+        stage("STACK CHECK"){
+            steps {
+                script {
+                    try {
+                        //CHECK IF STACK EXISTS
+                        sh 'aws cloudformation describe-stacks --stack-name ${STACK_NAME}'
+                        echo 'STACK ${STACK_NAME} DOES EXIST. CREATING CHANGE SET...'
+                        CREATE_STACK = "false"
+                    } catch (Exception e){
+                        echo 'STACK ${STACK_NAME} DOES NOT EXIST. CREATING NEW ONE...'
+                    }
+                }
+            }
+        }
+        stage("CHANGESET CREATE"){
+            when {
+                expression { CREATE_STACK == "false" }
+            }
+            steps {
+                script {
+                    echo 'STACK ${STACK_NAME} DOES EXIST. CREATING CHANGE SET...'
+                    def changesetID = ""
+
+                    if ("${USE_PARAMETERS}" == 'true'){
+                        sh(script: 'aws cloudformation create-change-set --capabilities CAPABILITY_NAMED_IAM --capabilities CAPABILITY_AUTO_EXPAND --stack-name ${STACK_NAME} --change-set-name ${STACK_NAME}-${GIT_COMMIT} --template-body file://${PATH_TEMPLATE} --parameters file://parameters.json', returnStdout: true)
+                    } else {
+                        sh(script: 'aws cloudformation create-change-set --capabilities CAPABILITY_NAMED_IAM --capabilities CAPABILITY_AUTO_EXPAND --stack-name ${STACK_NAME} --change-set-name ${STACK_NAME}-${GIT_COMMIT} --template-body file://${PATH_TEMPLATE}', returnStdout: true)
+                    }
+
+                    sh "aws cloudformation wait change-set-create-complete --change-set-name ${STACK_NAME}-${GIT_COMMIT} --stack-name ${STACK_NAME}"
+
+                    echo 'DESCRIBING CHANGESET ${STACK_NAME}-${GIT_COMMIT}'
+                    def changeSetJson = readJSON text: sh(script: 'aws cloudformation describe-change-set --stack-name ${STACK_NAME} --change-set-name ${STACK_NAME}-${GIT_COMMIT}', returnStdout: true)
+
+                    def changeSetActions = []
+                    
+                    // COLLECT ACTIONS ON CHANGE SET, NO EXECUTE CHANGE-SET AUTOMATIC ON MODIFY/DELETE
+                    for(change in changeSetJson.Changes) {
+                        changeSetActions.push(change.ResourceChange.Action)
+                    }
+
+                    if (!changeSetActions.contains("Modify") && !changeSetActions.contains("Remove")){
+                        echo "CHANGE-SET DOESN'T CONTAIN ANY MODIFICATIONS OR REMOVAL OF RESOURCES"
+                        EXECUTE_CHANGE_SET = true
+                    }
+                }
+            }
+            post {
+                failure {
+                    echo "CHANGE-SET CREATE FAILED, PROBABLY IT DOESN'T HAVE CHANGES"
+                    sh "aws cloudformation describe-stack-events --stack-name ${STACK_NAME} --max-items 50"
+                }
+            }
+        }
+        stage("CHANGESET EXECUTE"){
+            when {
+                expression { CREATE_STACK == "false" && EXECUTE_CHANGE_SET == true && "${ENVIRONMENT}" != "prd" }
+            }
+            steps {
+                script {
+                    try {
+                        sh 'aws cloudformation execute-change-set --stack-name ${STACK_NAME} --change-set-name ${STACK_NAME}-${GIT_COMMIT}'
+                        sh "aws cloudformation wait stack-update-complete --stack-name ${STACK_NAME}"
+                    } catch (Exception e) {
+                        echo "CHANGE-SET EXECUTE FAILED"
+                        sh "aws cloudformation describe-stack-events --stack-name ${STACK_NAME} --max-items 50"
+                    }
+                    
+                }
+            }
+        }
+        stage("STACK CREATE"){
+            when {
+                expression { CREATE_STACK == "true" }
+            }
+            steps{
+                script {
+                    if ("${USE_PARAMETERS}" == 'true'){
+                        sh 'aws cloudformation create-stack --capabilities CAPABILITY_NAMED_IAM --capabilities CAPABILITY_AUTO_EXPAND --stack-name ${STACK_NAME} --template-body file://${PATH_TEMPLATE} --parameters file://parameters.json'
+                    } else {
+                        sh 'aws cloudformation create-stack --capabilities CAPABILITY_NAMED_IAM --capabilities CAPABILITY_AUTO_EXPAND --stack-name ${STACK_NAME} --template-body file://${PATH_TEMPLATE}'
+                    }
+                    
+                    sh "aws cloudformation wait stack-create-complete --stack-name ${STACK_NAME}"
+                }
+            }
+            post{
+                success{
+                    echo "========executed successfully========"
+                }
+                failure{
+                    echo "========execution failed========"
+                    sh "aws cloudformation describe-stack-events --stack-name ${STACK_NAME} --max-items 50"
+                    echo "DELETING STACK ${STACK_NAME}..."
+                    sh "aws cloudformation delete-stack --stack-name ${STACK_NAME}"
+                }
+            }
+        }
+    }
+    post{
+        always{
+            echo "========always========"
+        }
+        success{
+            echo "========pipeline executed successfully ========"
+        }
+        failure{
+            echo "========pipeline execution failed========"
+        }
+    }
+}
